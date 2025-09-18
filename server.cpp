@@ -20,6 +20,12 @@ enum Want {
     NONE
 };
 
+enum Result {
+    NOT_FOUND,
+    SUCCESS,
+    COMMAND_ERROR,
+};
+
 
 struct Connection {
     int fd = -1;
@@ -27,6 +33,13 @@ struct Connection {
     std::vector<uint8_t> incoming;
     std::vector<uint8_t> outgoing;
 };
+
+struct Response {
+    Result status;
+    std::vector<uint8_t> data;
+};
+
+static std::map<std::string, std::string> data_store;
 
 void fd_set_nonblock(const int fd) {
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
@@ -74,6 +87,87 @@ int init_listening_socket() {
     return socket_fd;
 }
 
+uint32_t read_u32(const uint8_t *data, const uint8_t *end) {
+    if (end - data < 4) {
+        return -1;
+    }
+
+    uint32_t result = 0;
+    memcpy(&result, data, 4);
+    return result;
+}
+
+int32_t parse_request(uint8_t *request_data, size_t length, std::vector<std::string> &outgoing) {
+    uint32_t string_number = 0;
+    uint8_t *end = request_data + length;
+
+    string_number = read_u32(request_data, end);
+
+    if (string_number == -1 || string_number > k_max_msg) {
+        return -1;
+    }
+    request_data += 4;
+
+    for (int i = 0; i < string_number; ++i) {
+        uint32_t string_length = 0;
+        string_length = read_u32(request_data, end);
+
+        if (string_length == -1) {
+            return -1;
+        }
+
+        std::string string;
+        string.assign(reinterpret_cast<const char *>(request_data + 4), string_length);
+        outgoing.push_back(string);
+        request_data += string_length + 4;
+    }
+
+    if (request_data != end) {
+        std::cout << "El puntero no coincide con el final. Hay más datos?";
+        return -1; // trailing garbage
+    }
+    return 0;
+}
+
+static void do_request(std::vector<std::string> &cmd, Response &out) {
+    const std::string &command = cmd[0];
+
+    if (command == "get") {
+        if (cmd.size() != 2) {
+            out.status = COMMAND_ERROR;
+            return;
+        }
+        auto value = data_store.find(cmd[1]);
+        if (value == data_store.end()) {
+            out.status = NOT_FOUND;
+        } else {
+            out.status = SUCCESS;
+            out.data.assign(value->second.begin(), value->second.end());
+        }
+    } else if (command == "put") {
+        if (cmd.size() != 3) {
+            out.status = COMMAND_ERROR;
+        }
+        data_store.insert_or_assign(cmd[1], cmd[2]);
+        out.status = SUCCESS;
+    } else if (command == "del") {
+        if (cmd.size() != 2) {
+            out.status = COMMAND_ERROR;
+        }
+        data_store.erase(cmd[1]);
+        out.status = SUCCESS;
+    } else {
+        out.status = COMMAND_ERROR;
+    }
+}
+
+void serialize_response(Response *response, std::vector<uint8_t> &output_buffer) {
+    const uint32_t response_len = 4 + static_cast<uint32_t>(response->data.size());
+    buffer_append(output_buffer, reinterpret_cast<const uint8_t *>(&response_len), 4);
+    buffer_append(output_buffer, reinterpret_cast<const uint8_t *>(&response->status), 4);
+    buffer_append(output_buffer, response->data.data(), response->data.size());
+}
+
 bool try_parse_request(Connection *connection) {
     if (connection->incoming.size() < 4) {
         return false; //Not enough data
@@ -91,17 +185,17 @@ bool try_parse_request(Connection *connection) {
         return false; //need more data
     }
 
-    const uint8_t *request_data = connection->incoming.data() + 4;
+    uint8_t *request_data = connection->incoming.data() + 4;
 
-    //TODO: Crear la respuesta
+    std::vector<std::string> commands;
+    if (!parse_request(request_data, length, commands)) {
+        buffer_consume(connection->incoming, length + 4);
+    }
+    auto *response = new Response();
+    do_request(commands, *response);
+    serialize_response(response, connection->outgoing);
 
-    //de momento va a ser un echo
-    buffer_append(connection->outgoing, reinterpret_cast<const uint8_t *>(&length), 4);
-    buffer_append(connection->outgoing, request_data, length);
-
-    // remove the request from the buffer
-    buffer_consume(connection->incoming, length + 4);
-
+    delete response;
     return true;
 }
 
